@@ -14,3 +14,4 @@ rapier2d = { workspace = true }
 nalgebra = { workspace = true }
 rand = { workspace = true }
 futures-util = { workspace = true }
+clap = { version = "4.0", features = ["derive"] }

@@ -1,6 +1,7 @@
 mod physics;
 
 use anyhow::Result;
+use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use hellfire_crucible_shared::{
     ClientMessage, GameState, PlayerId, PlayerState, ServerMessage, Vec2, ARENA_SIZE, PLAYER_FORCE,
@@ -13,6 +14,14 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Mutex};
 use tokio::time;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+#[derive(Parser, Debug)]
+#[command(name = "hellfire-crucible-server")]
+#[command(about = "Hellfire Crucible game server")]
+struct Args {
+    #[arg(long, default_value = "443")]
+    port: u16,
+}
 
 struct Player {
     is_dead: bool,
@@ -298,6 +307,7 @@ async fn game_loop(game_server: SharedGameServer, broadcast_tx: broadcast::Sende
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
     let game_server = Arc::new(Mutex::new(GameServer::new()));
     let (broadcast_tx, mut _broadcast_rx) = broadcast::channel(1000);
     let broadcast_tx_clone = broadcast_tx.clone();
@@ -309,8 +319,9 @@ async fn main() -> Result<()> {
     });
 
     // Start TCP server
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await?;
-    println!("Server listening on 127.0.0.1:8080");
+    let addr = format!("0.0.0.0:{}", args.port);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    println!("Server listening on {}", addr);
 
     while let Ok((stream, _)) = listener.accept().await {
         let game_server_clone = game_server.clone();

@@ -15,3 +15,4 @@ wgpu = { workspace = true }
 bytemuck = { version = "1.14", features = ["derive"] }
 futures-util = { workspace = true }
 pollster = { workspace = true }
+clap = { version = "4.0", features = ["derive"] }

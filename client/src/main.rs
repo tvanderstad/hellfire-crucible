@@ -1,5 +1,6 @@
 use anyhow::Result;
 use bytemuck::{Pod, Zeroable};
+use clap::Parser;
 use hellfire_crucible_shared::{
     ClientMessage, GameState, PlayerId, ServerMessage, Vec2, ARENA_SIZE, BLADE_LENGTH, BLADE_WIDTH,
     PLAYER_SIZE,
@@ -23,6 +24,14 @@ macro_rules! hex_color {
         let b = u8::from_str_radix(&hex[4..6], 16).unwrap() as f32 / 255.0;
         [r, g, b]
     }};
+}
+
+#[derive(Parser, Debug)]
+#[command(name = "hellfire-crucible-client")]
+#[command(about = "Hellfire Crucible game client")]
+struct Args {
+    #[arg(long, default_value = "ws://127.0.0.1")]
+    server: String,
 }
 
 #[repr(C)]
@@ -394,10 +403,11 @@ struct Game {
     keys_pressed: [bool; 4], // W, A, S, D
     mouse_pos: Vec2,
     shutdown_rx: Option<mpsc::UnboundedReceiver<()>>,
+    server_url: String,
 }
 
 impl Game {
-    fn new() -> Self {
+    fn new(server_url: String) -> Self {
         Self {
             window: None,
             renderer: None,
@@ -409,6 +419,7 @@ impl Game {
             keys_pressed: [false; 4],
             mouse_pos: Vec2::zero(),
             shutdown_rx: None,
+            server_url,
         }
     }
 
@@ -474,8 +485,11 @@ impl ApplicationHandler for Game {
         self.renderer = Some(renderer);
 
         // Start network connection
+        let server_url = self.server_url.clone();
         tokio::spawn(async move {
-            if let Err(e) = connect_to_server(game_state, input_tx, input_rx, my_id).await {
+            if let Err(e) =
+                connect_to_server(game_state, input_tx, input_rx, my_id, server_url).await
+            {
                 eprintln!("Connection error: {e}");
             }
             // Send shutdown signal
@@ -590,11 +604,13 @@ async fn connect_to_server(
     _input_tx: mpsc::UnboundedSender<ClientMessage>,
     mut input_rx: mpsc::UnboundedReceiver<ClientMessage>,
     my_id: Arc<Mutex<Option<PlayerId>>>,
+    server_url: String,
 ) -> Result<()> {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::connect_async;
 
-    let (ws_stream, _) = connect_async("ws://127.0.0.1:8080").await?;
+    println!("Connecting to {server_url}...");
+    let (ws_stream, _) = connect_async(&server_url).await?;
     let (mut write, mut read) = ws_stream.split();
 
     // Send join message
@@ -654,12 +670,14 @@ async fn connect_to_server(
 }
 
 fn main() {
+    let args = Args::parse();
+
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _guard = rt.enter();
 
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut game = Game::new();
+    let mut game = Game::new(args.server);
     event_loop.run_app(&mut game).unwrap();
 }

@@ -41,7 +41,12 @@ struct Args {
 #[derive(Parser, Debug)]
 enum GameMode {
     /// Play as an AI with random movements
-    Ai,
+    Ai {
+        #[arg(long, default_value = "1")]
+        count: usize,
+    },
+    /// Local multiplayer - control two players with one client
+    Local,
 }
 
 #[repr(C)]
@@ -176,7 +181,12 @@ impl Renderer {
         }
     }
 
-    fn render(&mut self, game_state: &GameState, my_id: Option<PlayerId>) -> Result<()> {
+    fn render(
+        &mut self,
+        game_state: &GameState,
+        my_id: Option<PlayerId>,
+        my_id_2: Option<PlayerId>,
+    ) -> Result<()> {
         let output = self.surface.get_current_texture()?;
         let view = output
             .texture
@@ -258,6 +268,8 @@ impl Renderer {
                 hex_color!("#4D4D4D")
             } else if Some(player.id) == my_id {
                 hex_color!("#2DD296")
+            } else if Some(player.id) == my_id_2 {
+                hex_color!("#3D9EFF") // Blue for player 2
             } else {
                 hex_color!("#DF2040")
             };
@@ -409,16 +421,25 @@ struct Game {
     renderer: Option<Renderer>,
     game_state: Arc<Mutex<GameState>>,
     my_id: Arc<Mutex<Option<PlayerId>>>,
+    my_id_2: Arc<Mutex<Option<PlayerId>>>, // Second player ID for local multiplayer
     input_tx: Option<mpsc::UnboundedSender<ClientMessage>>,
-    keys_pressed: [bool; 4], // W, A, S, D
+    input_tx_2: Option<mpsc::UnboundedSender<ClientMessage>>, // Second player input
+    keys_pressed: [bool; 4],                                  // W, A, S, D
+    keys_pressed_2: [bool; 4],                                // Arrow keys for player 2
+    blade_rotating_cw: bool,                                  // J key for player 1
+    blade_rotating_ccw: bool,                                 // K key for player 1
+    blade_rotating_cw_2: bool,                                // Comma key for player 2
+    blade_rotating_ccw_2: bool,                               // Period key for player 2
     mouse_pos: Vec2,
+    mouse_pos_2: Vec2, // Mouse position for player 2
     shutdown_rx: Option<mpsc::UnboundedReceiver<()>>,
     server_url: String,
     ai_mode: bool,
+    local_mode: bool,
 }
 
 impl Game {
-    fn new(server_url: String, ai_mode: bool) -> Self {
+    fn new(server_url: String, ai_mode: bool, local_mode: bool) -> Self {
         Self {
             window: None,
             renderer: None,
@@ -426,12 +447,21 @@ impl Game {
                 players: Vec::new(),
             })),
             my_id: Arc::new(Mutex::new(None)),
+            my_id_2: Arc::new(Mutex::new(None)),
             input_tx: None,
+            input_tx_2: None,
             keys_pressed: [false; 4],
+            keys_pressed_2: [false; 4],
+            blade_rotating_cw: false,
+            blade_rotating_ccw: false,
+            blade_rotating_cw_2: false,
+            blade_rotating_ccw_2: false,
             mouse_pos: Vec2::zero(),
+            mouse_pos_2: Vec2::zero(),
             shutdown_rx: None,
             server_url,
             ai_mode,
+            local_mode,
         }
     }
 
@@ -458,10 +488,61 @@ impl Game {
                 movement.y /= mag;
             }
 
+            // Determine blade torque (J is CW, K is CCW)
+            let blade_torque = if self.blade_rotating_cw {
+                1.0
+            } else if self.blade_rotating_ccw {
+                -1.0
+            } else {
+                0.0
+            };
+
             let _ = tx.send(ClientMessage::Input {
                 movement,
                 blade_target: self.mouse_pos,
+                blade_torque,
             });
+        }
+
+        // Update player 2 if local multiplayer
+        if self.local_mode {
+            if let Some(tx) = &self.input_tx_2 {
+                let mut movement = Vec2::zero();
+                if self.keys_pressed_2[0] {
+                    movement.y += 1.0;
+                }
+                if self.keys_pressed_2[1] {
+                    movement.x -= 1.0;
+                }
+                if self.keys_pressed_2[2] {
+                    movement.y -= 1.0;
+                }
+                if self.keys_pressed_2[3] {
+                    movement.x += 1.0;
+                }
+
+                // Normalize diagonal movement
+                let mag = (movement.x * movement.x + movement.y * movement.y).sqrt();
+                if mag > 0.0 {
+                    movement.x /= mag;
+                    movement.y /= mag;
+                }
+
+                // Determine blade torque for player 2
+                let blade_torque_2 = if self.blade_rotating_ccw_2 {
+                    -1.0
+                } else if self.blade_rotating_cw_2 {
+                    1.0
+                } else {
+                    0.0
+                };
+
+                let _ = tx.send(ClientMessage::Input {
+                    movement,
+                    blade_target: self.mouse_pos_2,
+                    blade_torque: blade_torque_2,
+                });
+            }
         }
     }
 }
@@ -499,6 +580,36 @@ impl ApplicationHandler for Game {
         // Start network connection
         let server_url = self.server_url.clone();
         let ai_mode = self.ai_mode;
+        let local_mode = self.local_mode;
+
+        if local_mode {
+            // Create second player connection
+            let (input_tx_2, input_rx_2) = mpsc::unbounded_channel();
+            self.input_tx_2 = Some(input_tx_2.clone());
+
+            let game_state_2 = self.game_state.clone();
+            let my_id_2 = self.my_id_2.clone();
+            let server_url_2 = server_url.clone();
+            let shutdown_tx_2 = shutdown_tx.clone();
+
+            // Connect second player
+            tokio::spawn(async move {
+                if let Err(e) = connect_to_server(
+                    game_state_2,
+                    input_tx_2,
+                    input_rx_2,
+                    my_id_2,
+                    server_url_2,
+                    false,
+                )
+                .await
+                {
+                    eprintln!("Player 2 connection error: {e}");
+                }
+                let _ = shutdown_tx_2.send(());
+            });
+        }
+
         tokio::spawn(async move {
             if let Err(e) =
                 connect_to_server(game_state, input_tx, input_rx, my_id, server_url, ai_mode).await
@@ -538,7 +649,12 @@ impl ApplicationHandler for Game {
                 if let Some(renderer) = &mut self.renderer {
                     let game_state = pollster::block_on(self.game_state.lock()).clone();
                     let my_id = *pollster::block_on(self.my_id.lock());
-                    if let Err(e) = renderer.render(&game_state, my_id) {
+                    let my_id_2 = if self.local_mode {
+                        *pollster::block_on(self.my_id_2.lock())
+                    } else {
+                        None
+                    };
+                    if let Err(e) = renderer.render(&game_state, my_id, my_id_2) {
                         eprintln!("Render error: {e}");
                     }
                 }
@@ -580,6 +696,58 @@ impl ApplicationHandler for Game {
                             }
                         }
                     }
+                    // Player 2 controls (arrow keys)
+                    KeyCode::ArrowUp => {
+                        if self.local_mode {
+                            self.keys_pressed_2[0] = pressed;
+                            self.update_input();
+                        }
+                    }
+                    KeyCode::ArrowLeft => {
+                        if self.local_mode {
+                            self.keys_pressed_2[1] = pressed;
+                            self.update_input();
+                        }
+                    }
+                    KeyCode::ArrowDown => {
+                        if self.local_mode {
+                            self.keys_pressed_2[2] = pressed;
+                            self.update_input();
+                        }
+                    }
+                    KeyCode::ArrowRight => {
+                        if self.local_mode {
+                            self.keys_pressed_2[3] = pressed;
+                            self.update_input();
+                        }
+                    }
+                    KeyCode::Enter => {
+                        if pressed && self.local_mode {
+                            if let Some(tx) = &self.input_tx_2 {
+                                let _ = tx.send(ClientMessage::Respawn);
+                            }
+                        }
+                    }
+                    KeyCode::KeyJ => {
+                        self.blade_rotating_cw = pressed;
+                        self.update_input();
+                    }
+                    KeyCode::KeyK => {
+                        self.blade_rotating_ccw = pressed;
+                        self.update_input();
+                    }
+                    KeyCode::Comma => {
+                        if self.local_mode {
+                            self.blade_rotating_cw_2 = pressed;
+                            self.update_input();
+                        }
+                    }
+                    KeyCode::Period => {
+                        if self.local_mode {
+                            self.blade_rotating_ccw_2 = pressed;
+                            self.update_input();
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -603,6 +771,12 @@ impl ApplicationHandler for Game {
                     // Note: Y is flipped (screen Y increases downward, world Y increases upward)
                     self.mouse_pos.x = (position.x as f32 - screen_center_x) / pixels_per_meter;
                     self.mouse_pos.y = -(position.y as f32 - screen_center_y) / pixels_per_meter;
+
+                    // In local mode, player 2 aims opposite of player 1
+                    if self.local_mode {
+                        self.mouse_pos_2.x = -self.mouse_pos.x;
+                        self.mouse_pos_2.y = -self.mouse_pos.y;
+                    }
 
                     self.update_input();
                 }
@@ -722,18 +896,47 @@ async fn ai_controller(
                 continue;
             }
 
-            // Random movement
-            let action = rng.gen_range(0..10);
-            let movement = match action {
-                0..=2 => Vec2::new(0.0, 0.0),          // Stop
-                3 => Vec2::new(0.0, 1.0),              // Up
-                4 => Vec2::new(0.0, -1.0),             // Down
-                5 => Vec2::new(-1.0, 0.0),             // Left
-                6 => Vec2::new(1.0, 0.0),              // Right
-                7 => normalize(Vec2::new(1.0, 1.0)),   // Diagonal
-                8 => normalize(Vec2::new(-1.0, 1.0)),  // Diagonal
-                9 => normalize(Vec2::new(1.0, -1.0)),  // Diagonal
-                _ => normalize(Vec2::new(-1.0, -1.0)), // Diagonal
+            // Movement biased toward center
+            let to_center = Vec2::new(-player.position.x, -player.position.y);
+            let distance_from_center = (player.position.x * player.position.x
+                + player.position.y * player.position.y)
+                .sqrt();
+
+            // Only move toward center if far from it (> 5 meters)
+            let center_bias = if distance_from_center > 5.0 {
+                normalize(to_center)
+            } else {
+                Vec2::new(0.0, 0.0)
+            };
+
+            // Random movement with more variety
+            let action = rng.gen_range(0..20);
+            let random_movement = match action {
+                0..=4 => Vec2::new(0.0, 0.0),           // Stop (25%)
+                5..=6 => Vec2::new(0.0, 1.0),           // Up
+                7..=8 => Vec2::new(0.0, -1.0),          // Down
+                9..=10 => Vec2::new(-1.0, 0.0),         // Left
+                11..=12 => Vec2::new(1.0, 0.0),         // Right
+                13 => normalize(Vec2::new(1.0, 1.0)),   // Diagonal
+                14 => normalize(Vec2::new(-1.0, 1.0)),  // Diagonal
+                15 => normalize(Vec2::new(1.0, -1.0)),  // Diagonal
+                16 => normalize(Vec2::new(-1.0, -1.0)), // Diagonal
+                // Circling movements
+                17 => normalize(Vec2::new(-player.position.y, player.position.x)), // Circle left
+                18 => normalize(Vec2::new(player.position.y, -player.position.x)), // Circle right
+                _ => normalize(Vec2::new(0.7, 0.7)), // Default diagonal
+            };
+
+            // Combine with less center bias (30% center, 70% random) when far from center
+            let bias_strength = if distance_from_center > 7.0 { 0.3 } else { 0.1 };
+            let combined = Vec2::new(
+                center_bias.x * bias_strength + random_movement.x * (1.0 - bias_strength),
+                center_bias.y * bias_strength + random_movement.y * (1.0 - bias_strength),
+            );
+            let movement = if combined.x.abs() > 0.001 || combined.y.abs() > 0.001 {
+                normalize(combined)
+            } else {
+                Vec2::new(0.0, 0.0)
             };
 
             // Random blade target
@@ -744,9 +947,17 @@ async fn ai_controller(
                 player.position.y + blade_offset_y,
             );
 
+            // Random blade torque for AI
+            let blade_torque = match rng.gen_range(0..20) {
+                0 => -1.0, // CCW
+                1 => 1.0,  // CW
+                _ => 0.0,  // No torque most of the time
+            };
+
             let _ = input_tx.send(ClientMessage::Input {
                 movement,
                 blade_target,
+                blade_torque,
             });
         }
     }
@@ -761,21 +972,76 @@ fn normalize(v: Vec2) -> Vec2 {
     }
 }
 
+async fn run_headless_ai(server_url: String, ai_number: usize) {
+    println!("AI {} connecting to {}", ai_number, server_url);
+
+    loop {
+        let game_state = Arc::new(Mutex::new(GameState {
+            players: Vec::new(),
+        }));
+        let my_id = Arc::new(Mutex::new(None));
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+
+        match connect_to_server(
+            game_state.clone(),
+            input_tx.clone(),
+            input_rx,
+            my_id.clone(),
+            server_url.clone(),
+            true,
+        )
+        .await
+        {
+            Ok(_) => println!("AI {} disconnected normally", ai_number),
+            Err(e) => println!("AI {} disconnected with error: {}", ai_number, e),
+        }
+
+        println!("AI {} reconnecting in 1 second...", ai_number);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
 fn main() {
     let args = Args::parse();
 
-    let ai_mode = matches!(args.mode, Some(GameMode::Ai));
+    let (ai_mode, ai_count) = match args.mode {
+        Some(GameMode::Ai { count }) => (true, count),
+        _ => (false, 0),
+    };
+    let local_mode = matches!(args.mode, Some(GameMode::Local));
 
     // For production: cargo run -- --server wss://hellfirecrucible.com
     // For local dev: cargo run (uses ws://localhost:8080)
-    // For AI mode: cargo run -- ai
+    // For AI mode: cargo run -- ai --count 5
+    // For local multiplayer: cargo run -- local
 
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let _guard = rt.enter();
 
-    let event_loop = EventLoop::new().unwrap();
-    event_loop.set_control_flow(ControlFlow::Poll);
+    if ai_mode {
+        // Run headless AI mode
+        rt.block_on(async {
+            for i in 0..ai_count {
+                let server = args.server.clone();
+                tokio::spawn(async move {
+                    // Stagger spawn by 1 second each
+                    tokio::time::sleep(Duration::from_secs(i as u64)).await;
+                    run_headless_ai(server, i + 1).await;
+                });
+            }
 
-    let mut game = Game::new(args.server, ai_mode);
-    event_loop.run_app(&mut game).unwrap();
+            // Keep the main thread alive
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+    } else {
+        // Run normal windowed mode
+        let _guard = rt.enter();
+
+        let event_loop = EventLoop::new().unwrap();
+        event_loop.set_control_flow(ControlFlow::Poll);
+
+        let mut game = Game::new(args.server, false, local_mode);
+        event_loop.run_app(&mut game).unwrap();
+    }
 }

@@ -6,6 +6,14 @@ use rapier2d::parry::query;
 use rapier2d::prelude::*;
 use std::collections::HashMap;
 
+// Physics constants
+const WALL_THICKNESS: f32 = 1.0;
+const PLAYER_LINEAR_DAMPING: f32 = 10.0;
+const PLAYER_ANGULAR_DAMPING: f32 = 5.0;
+const BLADE_LINEAR_DAMPING: f32 = 5.0;
+const BLADE_ANGULAR_DAMPING: f32 = 100.0;
+const BLADE_DENSITY: f32 = 0.1;
+
 pub struct PhysicsWorld {
     rigid_body_set: RigidBodySet,
     collider_set: ColliderSet,
@@ -49,7 +57,7 @@ impl PhysicsWorld {
 
     fn create_walls(&mut self) {
         let half_size = ARENA_SIZE / 2.0;
-        let wall_thickness = 1.0;
+        let wall_thickness = WALL_THICKNESS;
 
         let walls = [
             (
@@ -88,8 +96,8 @@ impl PhysicsWorld {
         // Create player body
         let player = RigidBodyBuilder::dynamic()
             .translation(vector![position.x, position.y])
-            .linear_damping(5.0)
-            .angular_damping(5.0)
+            .linear_damping(PLAYER_LINEAR_DAMPING)
+            .angular_damping(PLAYER_ANGULAR_DAMPING)
             .lock_rotations()
             .ccd_enabled(true)
             .build();
@@ -106,14 +114,14 @@ impl PhysicsWorld {
         let blade_center = BLADE_OFFSET + BLADE_LENGTH / 2.0;
         let blade = RigidBodyBuilder::dynamic()
             .translation(vector![position.x, position.y + blade_center])
-            .linear_damping(1.0)
-            .angular_damping(0.5)
+            .linear_damping(BLADE_LINEAR_DAMPING)
+            .angular_damping(BLADE_ANGULAR_DAMPING)
             .ccd_enabled(true)
             .build();
         let blade_handle = self.rigid_body_set.insert(blade);
 
         let blade_collider = ColliderBuilder::cuboid(BLADE_WIDTH / 2.0, BLADE_LENGTH / 2.0)
-            .density(1.) // Lower density so blades are lighter and more responsive
+            .density(BLADE_DENSITY)
             .build();
         let blade_collider_handle = self.collider_set.insert_with_parent(
             blade_collider,
@@ -137,6 +145,7 @@ impl PhysicsWorld {
     }
 
     pub fn remove_player(&mut self, player_id: PlayerId) {
+        // Remove blade first (this also removes any joints)
         if let Some(blade_handle) = self.blade_bodies.remove(&player_id) {
             self.rigid_body_set.remove(
                 blade_handle,
@@ -144,10 +153,11 @@ impl PhysicsWorld {
                 &mut self.collider_set,
                 &mut self.impulse_joint_set,
                 &mut self.multibody_joint_set,
-                false,
+                true, // wake_up = true to ensure proper cleanup
             );
         }
 
+        // Then remove player
         if let Some(player_handle) = self.player_bodies.remove(&player_id) {
             self.rigid_body_set.remove(
                 player_handle,
@@ -155,11 +165,15 @@ impl PhysicsWorld {
                 &mut self.collider_set,
                 &mut self.impulse_joint_set,
                 &mut self.multibody_joint_set,
-                false,
+                true, // wake_up = true to ensure proper cleanup
             );
         }
 
+        // Clean up blade collider reference
         self.blade_colliders.remove(&player_id);
+
+        // Force update of spatial data structures
+        self.query_pipeline.update(&self.collider_set);
     }
 
     pub fn apply_player_force(&mut self, player_id: PlayerId, force: Vec2) {
@@ -167,6 +181,17 @@ impl PhysicsWorld {
             if let Some(body) = self.rigid_body_set.get_mut(handle) {
                 body.reset_forces(false);
                 body.add_force(vector![force.x, force.y], true);
+            }
+        }
+    }
+
+    pub fn apply_blade_torque(&mut self, player_id: PlayerId, torque: f32) {
+        if let Some(&handle) = self.blade_bodies.get(&player_id) {
+            if let Some(body) = self.rigid_body_set.get_mut(handle) {
+                body.reset_torques(true);
+                if torque != 0.0 {
+                    body.add_torque(torque, true);
+                }
             }
         }
     }
@@ -203,12 +228,27 @@ impl PhysicsWorld {
         })
     }
 
+    pub fn get_player_velocity(&self, player_id: PlayerId) -> Option<Vec2> {
+        self.player_bodies.get(&player_id).and_then(|&handle| {
+            self.rigid_body_set.get(handle).map(|body| {
+                let vel = body.linvel();
+                Vec2::new(vel.x, vel.y)
+            })
+        })
+    }
+
     pub fn get_blade_angle(&self, player_id: PlayerId) -> Option<f32> {
         self.blade_bodies.get(&player_id).and_then(|&handle| {
             self.rigid_body_set
                 .get(handle)
                 .map(|body| body.rotation().angle())
         })
+    }
+
+    pub fn get_blade_angular_velocity(&self, player_id: PlayerId) -> Option<f32> {
+        self.blade_bodies
+            .get(&player_id)
+            .and_then(|&handle| self.rigid_body_set.get(handle).map(|body| body.angvel()))
     }
 
     pub fn get_blade_position(&self, player_id: PlayerId) -> Option<Vec2> {
@@ -226,6 +266,11 @@ impl PhysicsWorld {
         for (&attacker_id, &blade_collider) in &self.blade_colliders {
             // Verify the blade body still exists
             if !self.blade_bodies.contains_key(&attacker_id) {
+                continue;
+            }
+
+            // Also verify the collider still exists in the collider set
+            if !self.collider_set.contains(blade_collider) {
                 continue;
             }
 
@@ -272,7 +317,15 @@ impl PhysicsWorld {
     }
 
     pub fn remove_blade(&mut self, player_id: PlayerId) {
+        // Remove blade body (this also removes associated colliders and joints)
         if let Some(blade_handle) = self.blade_bodies.remove(&player_id) {
+            // Get all associated colliders before removal
+            let colliders: Vec<_> = self
+                .rigid_body_set
+                .get(blade_handle)
+                .map(|body| body.colliders().to_vec())
+                .unwrap_or_default();
+
             self.rigid_body_set.remove(
                 blade_handle,
                 &mut self.island_manager,
@@ -281,7 +334,19 @@ impl PhysicsWorld {
                 &mut self.multibody_joint_set,
                 true,
             );
+
+            // Verify colliders were removed
+            for collider_handle in colliders {
+                if self.collider_set.contains(collider_handle) {
+                    eprintln!(
+                        "Warning: Collider {:?} not removed with blade body",
+                        collider_handle
+                    );
+                }
+            }
         }
+
+        // Clean up blade collider reference
         self.blade_colliders.remove(&player_id);
 
         // Force update of spatial data structures
@@ -294,14 +359,14 @@ impl PhysicsWorld {
             let blade_center = BLADE_OFFSET + BLADE_LENGTH / 2.0;
             let blade = RigidBodyBuilder::dynamic()
                 .translation(vector![player_position.x, player_position.y + blade_center])
-                .linear_damping(1.0)
-                .angular_damping(0.5)
+                .linear_damping(BLADE_LINEAR_DAMPING)
+                .angular_damping(BLADE_ANGULAR_DAMPING)
                 .ccd_enabled(true)
                 .build();
             let blade_handle = self.rigid_body_set.insert(blade);
 
             let blade_collider = ColliderBuilder::cuboid(BLADE_WIDTH / 2.0, BLADE_LENGTH / 2.0)
-                .density(0.1)
+                .density(BLADE_DENSITY)
                 .build();
             let blade_collider_handle = self.collider_set.insert_with_parent(
                 blade_collider,

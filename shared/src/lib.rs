@@ -11,7 +11,9 @@ pub const BLADE_OFFSET: f32 = 1.0; // blade starts 1 meter from player center
 
 // Forces and torques
 pub const PLAYER_FORCE: f32 = 50.0; // Newtons
-pub const BLADE_TORQUE: f32 = 10.0; // Newton-meters
+pub const PLAYER_MAX_VELOCITY: f32 = 10.0; // Max meters/second
+pub const BLADE_TORQUE_MULTIPLIER: f32 = 10.0; // Multiplier for blade torque input
+pub const BLADE_MAX_ANGULAR_VELOCITY: f32 = 2.0; // Max radians/second
 
 // Game constants
 pub const TICK_RATE: u64 = 60;
@@ -54,6 +56,7 @@ pub enum ClientMessage {
     Input {
         movement: Vec2,     // normalized -1 to 1
         blade_target: Vec2, // target position in world space
+        blade_torque: f32,  // -1 for CCW, 0 for none, 1 for CW
     },
     Respawn,
 }

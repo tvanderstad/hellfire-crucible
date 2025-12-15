@@ -4,7 +4,8 @@ use anyhow::Result;
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use hellfire_crucible_shared::{
-    ClientMessage, GameState, PlayerId, PlayerState, ServerMessage, Vec2, ARENA_SIZE, PLAYER_FORCE,
+    ClientMessage, GameState, PlayerId, PlayerState, ServerMessage, Vec2, ARENA_SIZE,
+    BLADE_MAX_ANGULAR_VELOCITY, BLADE_TORQUE_MULTIPLIER, PLAYER_FORCE, PLAYER_MAX_VELOCITY,
     TICK_DURATION,
 };
 use physics::PhysicsWorld;
@@ -36,6 +37,7 @@ struct Args {
 struct Player {
     is_dead: bool,
     input_movement: Vec2,
+    blade_torque: f32,
 }
 
 struct GameServer {
@@ -59,12 +61,11 @@ impl GameServer {
 
         let spawn_pos = self.find_spawn_position();
         self.physics.add_player(id, spawn_pos);
-        // Ensure clean spawn state
-        self.physics.respawn_player(id, spawn_pos);
 
         let player = Player {
             is_dead: false,
             input_movement: Vec2::zero(),
+            blade_torque: 0.0,
         };
         self.players.insert(id, player);
 
@@ -76,11 +77,12 @@ impl GameServer {
         self.players.remove(&id);
     }
 
-    fn handle_input(&mut self, id: PlayerId, movement: Vec2) {
+    fn handle_input(&mut self, id: PlayerId, movement: Vec2, blade_torque: f32) {
         if let Some(player) = self.players.get_mut(&id) {
             // Only process input from living players
             if !player.is_dead {
                 player.input_movement = movement;
+                player.blade_torque = blade_torque;
             }
         }
     }
@@ -100,6 +102,7 @@ impl GameServer {
             player.is_dead = false;
             // Clear input state on respawn
             player.input_movement = Vec2::zero();
+            player.blade_torque = 0.0;
         }
 
         self.physics.respawn_player(id, spawn_pos);
@@ -111,12 +114,54 @@ impl GameServer {
         // Apply forces based on player inputs
         for (&id, player) in &self.players {
             if !player.is_dead {
-                // Apply movement force
-                let force = Vec2::new(
-                    player.input_movement.x * PLAYER_FORCE,
-                    player.input_movement.y * PLAYER_FORCE,
-                );
-                self.physics.apply_player_force(id, force);
+                // Apply movement force only if not at max velocity in that direction
+                if let Some(current_vel) = self.physics.get_player_velocity(id) {
+                    let input = player.input_movement;
+                    let mut force = Vec2::new(0.0, 0.0);
+
+                    // Check X direction
+                    let same_dir_x = (current_vel.x > 0.0 && input.x > 0.0)
+                        || (current_vel.x < 0.0 && input.x < 0.0);
+                    if !same_dir_x || current_vel.x.abs() < PLAYER_MAX_VELOCITY {
+                        force.x = input.x * PLAYER_FORCE;
+                    }
+
+                    // Check Y direction
+                    let same_dir_y = (current_vel.y > 0.0 && input.y > 0.0)
+                        || (current_vel.y < 0.0 && input.y < 0.0);
+                    if !same_dir_y || current_vel.y.abs() < PLAYER_MAX_VELOCITY {
+                        force.y = input.y * PLAYER_FORCE;
+                    }
+
+                    self.physics.apply_player_force(id, force);
+                } else {
+                    // No velocity info, apply force normally
+                    let force = Vec2::new(
+                        player.input_movement.x * PLAYER_FORCE,
+                        player.input_movement.y * PLAYER_FORCE,
+                    );
+                    self.physics.apply_player_force(id, force);
+                }
+
+                // Apply blade torque (this also resets torques when player.blade_torque is 0)
+                if let Some(angular_vel) = self.physics.get_blade_angular_velocity(id) {
+                    if player.blade_torque != 0.0 {
+                        // Allow counter-torque to stop spinning
+                        // Only limit torque if trying to spin faster in same direction
+                        let same_direction = (angular_vel > 0.0 && player.blade_torque > 0.0)
+                            || (angular_vel < 0.0 && player.blade_torque < 0.0);
+
+                        if !same_direction || angular_vel.abs() < BLADE_MAX_ANGULAR_VELOCITY {
+                            self.physics.apply_blade_torque(
+                                id,
+                                player.blade_torque * BLADE_TORQUE_MULTIPLIER,
+                            );
+                        }
+                    } else {
+                        // Reset torques when no input
+                        self.physics.apply_blade_torque(id, 0.0);
+                    }
+                }
             }
         }
 
@@ -133,6 +178,7 @@ impl GameServer {
                         victim.is_dead = true;
                         // Clear input state when player dies
                         victim.input_movement = Vec2::zero();
+                        victim.blade_torque = 0.0;
                         // Remove blade when player dies
                         self.physics.remove_blade(victim_id);
                     }
@@ -268,8 +314,9 @@ where
                         ClientMessage::Input {
                             movement,
                             blade_target: _,
+                            blade_torque,
                         } => {
-                            server.handle_input(player_id, movement);
+                            server.handle_input(player_id, movement, blade_torque);
                         }
                         ClientMessage::Respawn => {
                             server.respawn_player(player_id);

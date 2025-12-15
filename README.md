@@ -19,7 +19,8 @@ cargo run -p hellfire-crucible-client
 ## Controls
 
 - **WASD**: Move your character
-- **Mouse**: Aim your blade
+- **J**: Rotate blade clockwise
+- **K**: Rotate blade counter-clockwise
 - **Space**: Respawn when dead
 
 ## Gameplay

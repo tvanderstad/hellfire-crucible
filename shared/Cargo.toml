@@ -1,0 +1,10 @@
+[package]
+name = "hellfire-crucible-shared"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+rapier2d = { workspace = true }
+nalgebra = { workspace = true }

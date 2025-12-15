@@ -1,0 +1,17 @@
+[package]
+name = "hellfire-crucible-client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hellfire-crucible-shared = { path = "../shared" }
+tokio = { workspace = true, features = ["rt", "macros"] }
+tokio-tungstenite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+winit = { workspace = true }
+wgpu = { workspace = true }
+bytemuck = { version = "1.14", features = ["derive"] }
+futures-util = { workspace = true }
+pollster = { workspace = true }

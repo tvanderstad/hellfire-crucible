@@ -1,0 +1,16 @@
+[package]
+name = "hellfire-crucible-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hellfire-crucible-shared = { path = "../shared" }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+rapier2d = { workspace = true }
+nalgebra = { workspace = true }
+rand = { workspace = true }
+futures-util = { workspace = true }

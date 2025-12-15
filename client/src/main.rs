@@ -6,6 +6,7 @@ use hellfire_crucible_shared::{
     PLAYER_SIZE,
 };
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 use winit::{
     application::ApplicationHandler,
@@ -30,8 +31,17 @@ macro_rules! hex_color {
 #[command(name = "hellfire-crucible-client")]
 #[command(about = "Hellfire Crucible game client")]
 struct Args {
-    #[arg(long, default_value = "ws://localhost:8080")]
+    #[arg(long, default_value = "ws://localhost:8080", global = true)]
     server: String,
+
+    #[command(subcommand)]
+    mode: Option<GameMode>,
+}
+
+#[derive(Parser, Debug)]
+enum GameMode {
+    /// Play as an AI with random movements
+    Ai,
 }
 
 #[repr(C)]
@@ -404,10 +414,11 @@ struct Game {
     mouse_pos: Vec2,
     shutdown_rx: Option<mpsc::UnboundedReceiver<()>>,
     server_url: String,
+    ai_mode: bool,
 }
 
 impl Game {
-    fn new(server_url: String) -> Self {
+    fn new(server_url: String, ai_mode: bool) -> Self {
         Self {
             window: None,
             renderer: None,
@@ -420,6 +431,7 @@ impl Game {
             mouse_pos: Vec2::zero(),
             shutdown_rx: None,
             server_url,
+            ai_mode,
         }
     }
 
@@ -486,9 +498,10 @@ impl ApplicationHandler for Game {
 
         // Start network connection
         let server_url = self.server_url.clone();
+        let ai_mode = self.ai_mode;
         tokio::spawn(async move {
             if let Err(e) =
-                connect_to_server(game_state, input_tx, input_rx, my_id, server_url).await
+                connect_to_server(game_state, input_tx, input_rx, my_id, server_url, ai_mode).await
             {
                 eprintln!("Connection error: {e}");
             }
@@ -605,6 +618,7 @@ async fn connect_to_server(
     mut input_rx: mpsc::UnboundedReceiver<ClientMessage>,
     my_id: Arc<Mutex<Option<PlayerId>>>,
     server_url: String,
+    ai_mode: bool,
 ) -> Result<()> {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::connect_async;
@@ -619,6 +633,16 @@ async fn connect_to_server(
             serde_json::to_string(&ClientMessage::Join)?,
         ))
         .await?;
+
+    // Start AI controller if in AI mode
+    if ai_mode {
+        let ai_tx = _input_tx.clone();
+        let ai_game_state = game_state.clone();
+        let ai_my_id = my_id.clone();
+        tokio::spawn(async move {
+            ai_controller(ai_tx, ai_game_state, ai_my_id).await;
+        });
+    }
 
     // Handle messages
     loop {
@@ -669,11 +693,82 @@ async fn connect_to_server(
     }
 }
 
+async fn ai_controller(
+    input_tx: mpsc::UnboundedSender<ClientMessage>,
+    game_state: Arc<Mutex<GameState>>,
+    my_id: Arc<Mutex<Option<PlayerId>>>,
+) {
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    let mut rng = StdRng::from_entropy();
+
+    loop {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Check if we have an ID yet
+        let id = *my_id.lock().await;
+        if id.is_none() {
+            continue;
+        }
+
+        // Get current game state
+        let state = game_state.lock().await.clone();
+        let my_player = state.players.iter().find(|p| Some(p.id) == id);
+
+        if let Some(player) = my_player {
+            if player.is_dead {
+                // Respawn after a delay
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let _ = input_tx.send(ClientMessage::Respawn);
+                continue;
+            }
+
+            // Random movement
+            let action = rng.gen_range(0..10);
+            let movement = match action {
+                0..=2 => Vec2::new(0.0, 0.0),          // Stop
+                3 => Vec2::new(0.0, 1.0),              // Up
+                4 => Vec2::new(0.0, -1.0),             // Down
+                5 => Vec2::new(-1.0, 0.0),             // Left
+                6 => Vec2::new(1.0, 0.0),              // Right
+                7 => normalize(Vec2::new(1.0, 1.0)),   // Diagonal
+                8 => normalize(Vec2::new(-1.0, 1.0)),  // Diagonal
+                9 => normalize(Vec2::new(1.0, -1.0)),  // Diagonal
+                _ => normalize(Vec2::new(-1.0, -1.0)), // Diagonal
+            };
+
+            // Random blade target
+            let blade_offset_x = rng.gen_range(-5.0..5.0);
+            let blade_offset_y = rng.gen_range(-5.0..5.0);
+            let blade_target = Vec2::new(
+                player.position.x + blade_offset_x,
+                player.position.y + blade_offset_y,
+            );
+
+            let _ = input_tx.send(ClientMessage::Input {
+                movement,
+                blade_target,
+            });
+        }
+    }
+}
+
+fn normalize(v: Vec2) -> Vec2 {
+    let mag = (v.x * v.x + v.y * v.y).sqrt();
+    if mag > 0.0 {
+        Vec2::new(v.x / mag, v.y / mag)
+    } else {
+        v
+    }
+}
+
 fn main() {
     let args = Args::parse();
 
+    let ai_mode = matches!(args.mode, Some(GameMode::Ai));
+
     // For production: cargo run -- --server wss://hellfirecrucible.com
     // For local dev: cargo run (uses ws://localhost:8080)
+    // For AI mode: cargo run -- ai
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _guard = rt.enter();
@@ -681,6 +776,6 @@ fn main() {
     let event_loop = EventLoop::new().unwrap();
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut game = Game::new(args.server);
+    let mut game = Game::new(args.server, ai_mode);
     event_loop.run_app(&mut game).unwrap();
 }

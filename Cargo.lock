@@ -959,6 +959,7 @@ dependencies = [
  "futures-util",
  "hellfire-crucible-shared",
  "pollster",
+ "rand",
  "serde",
  "serde_json",
  "tokio",

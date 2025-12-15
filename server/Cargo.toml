@@ -15,3 +15,5 @@ nalgebra = { workspace = true }
 rand = { workspace = true }
 futures-util = { workspace = true }
 clap = { version = "4.0", features = ["derive"] }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }

@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Mutex};
 use tokio::time;
+use tokio_rustls::{rustls, TlsAcceptor};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 #[derive(Parser, Debug)]
@@ -21,6 +22,15 @@ use tokio_tungstenite::{accept_async, tungstenite::Message};
 struct Args {
     #[arg(long, default_value = "443")]
     port: u16,
+
+    #[arg(long, help = "Path to TLS certificate file (PEM format)")]
+    cert: Option<String>,
+
+    #[arg(long, help = "Path to TLS private key file (PEM format)")]
+    key: Option<String>,
+
+    #[arg(long, help = "Disable TLS even if certificates exist")]
+    no_tls: bool,
 }
 
 struct Player {
@@ -205,12 +215,14 @@ impl GameServer {
 
 type SharedGameServer = Arc<Mutex<GameServer>>;
 
-async fn handle_connection(
+async fn handle_connection_with_stream<S>(
     game_server: SharedGameServer,
-    raw_stream: tokio::net::TcpStream,
+    ws_stream: tokio_tungstenite::WebSocketStream<S>,
     broadcast_tx: broadcast::Sender<ServerMessage>,
-) -> Result<()> {
-    let ws_stream = accept_async(raw_stream).await?;
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
     // Add player
@@ -305,6 +317,32 @@ async fn game_loop(game_server: SharedGameServer, broadcast_tx: broadcast::Sende
     }
 }
 
+async fn load_tls_config(cert_path: &str, key_path: &str) -> Result<rustls::ServerConfig> {
+    use rustls_pemfile::{certs, pkcs8_private_keys};
+    use std::io::BufReader;
+
+    let cert_file = std::fs::File::open(cert_path)?;
+    let key_file = std::fs::File::open(key_path)?;
+
+    let mut cert_reader = BufReader::new(cert_file);
+    let mut key_reader = BufReader::new(key_file);
+
+    let cert_chain = certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
+
+    let keys = pkcs8_private_keys(&mut key_reader).collect::<Result<Vec<_>, _>>()?;
+
+    let key = keys
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("No private key found"))?;
+
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, rustls::pki_types::PrivateKeyDer::Pkcs8(key))?;
+
+    Ok(config)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -318,17 +356,100 @@ async fn main() -> Result<()> {
         game_loop(game_server_clone, broadcast_tx_clone).await;
     });
 
+    // Setup TLS
+    let tls_acceptor = if args.no_tls {
+        println!("TLS disabled by --no-tls flag");
+        None
+    } else {
+        // Use provided paths or defaults
+        let cert_path = args
+            .cert
+            .as_deref()
+            .unwrap_or("/etc/letsencrypt/live/hellfirecrucible.com/fullchain.pem");
+        let key_path = args
+            .key
+            .as_deref()
+            .unwrap_or("/etc/letsencrypt/live/hellfirecrucible.com/privkey.pem");
+
+        if std::path::Path::new(cert_path).exists() && std::path::Path::new(key_path).exists() {
+            println!("Loading TLS certificate from {cert_path} and key from {key_path}");
+            match load_tls_config(cert_path, key_path).await {
+                Ok(config) => Some(TlsAcceptor::from(Arc::new(config))),
+                Err(e) => {
+                    eprintln!("Failed to load TLS config: {e}");
+                    eprintln!("Running without TLS");
+                    None
+                }
+            }
+        } else {
+            println!("Certificate files not found, running without TLS (ws://)");
+            None
+        }
+    };
+
     // Start TCP server
     let addr = format!("0.0.0.0:{}", args.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    println!("Server listening on {}", addr);
+
+    if tls_acceptor.is_some() {
+        println!("Server listening on {addr} (wss://)");
+    } else {
+        println!("Server listening on {addr} (ws://)");
+    }
 
     while let Ok((stream, _)) = listener.accept().await {
         let game_server_clone = game_server.clone();
         let broadcast_tx_clone = broadcast_tx.clone();
+        let tls_acceptor = tls_acceptor.clone();
+
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(game_server_clone, stream, broadcast_tx_clone).await {
-                eprintln!("Connection error: {e}");
+            match tls_acceptor {
+                Some(acceptor) => {
+                    // Accept TLS connection
+                    match acceptor.accept(stream).await {
+                        Ok(tls_stream) => {
+                            // Convert TLS stream to WebSocket
+                            match accept_async(tls_stream).await {
+                                Ok(ws) => {
+                                    if let Err(e) = handle_connection_with_stream(
+                                        game_server_clone,
+                                        ws,
+                                        broadcast_tx_clone,
+                                    )
+                                    .await
+                                    {
+                                        eprintln!("Connection error: {e}");
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("WebSocket handshake error: {e}");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("TLS handshake error: {e}");
+                        }
+                    }
+                }
+                None => {
+                    // No TLS, direct WebSocket
+                    match accept_async(stream).await {
+                        Ok(ws) => {
+                            if let Err(e) = handle_connection_with_stream(
+                                game_server_clone,
+                                ws,
+                                broadcast_tx_clone,
+                            )
+                            .await
+                            {
+                                eprintln!("Connection error: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("WebSocket handshake error: {e}");
+                        }
+                    }
+                }
             }
         });
     }

@@ -30,7 +30,7 @@ macro_rules! hex_color {
 #[command(name = "hellfire-crucible-client")]
 #[command(about = "Hellfire Crucible game client")]
 struct Args {
-    #[arg(long, default_value = "ws://127.0.0.1")]
+    #[arg(long, default_value = "ws://localhost:8080")]
     server: String,
 }
 
@@ -671,6 +671,9 @@ async fn connect_to_server(
 
 fn main() {
     let args = Args::parse();
+
+    // For production: cargo run -- --server wss://hellfirecrucible.com
+    // For local dev: cargo run (uses ws://localhost:8080)
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _guard = rt.enter();

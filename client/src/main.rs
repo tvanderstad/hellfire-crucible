@@ -393,6 +393,7 @@ struct Game {
     input_tx: Option<mpsc::UnboundedSender<ClientMessage>>,
     keys_pressed: [bool; 4], // W, A, S, D
     mouse_pos: Vec2,
+    shutdown_rx: Option<mpsc::UnboundedReceiver<()>>,
 }
 
 impl Game {
@@ -407,6 +408,7 @@ impl Game {
             input_tx: None,
             keys_pressed: [false; 4],
             mouse_pos: Vec2::zero(),
+            shutdown_rx: None,
         }
     }
 
@@ -462,6 +464,10 @@ impl ApplicationHandler for Game {
 
         let my_id = self.my_id.clone();
 
+        // Create shutdown channel
+        let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
+        self.shutdown_rx = Some(shutdown_rx);
+
         // Initialize renderer
         let window_clone = window.clone();
         let renderer = pollster::block_on(Renderer::new(window_clone)).unwrap();
@@ -472,6 +478,8 @@ impl ApplicationHandler for Game {
             if let Err(e) = connect_to_server(game_state, input_tx, input_rx, my_id).await {
                 eprintln!("Connection error: {e}");
             }
+            // Send shutdown signal
+            let _ = shutdown_tx.send(());
         });
     }
 
@@ -481,6 +489,15 @@ impl ApplicationHandler for Game {
         _window_id: winit::window::WindowId,
         event: WindowEvent,
     ) {
+        // Check for shutdown signal
+        if let Some(shutdown_rx) = &mut self.shutdown_rx {
+            if shutdown_rx.try_recv().is_ok() {
+                eprintln!("Client shutting down due to lost connection");
+                event_loop.exit();
+                return;
+            }
+        }
+
         match event {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
@@ -612,27 +629,28 @@ async fn connect_to_server(
                         }
                     }
                     Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None => {
-                        println!("Connection closed");
-                        break;
+                        eprintln!("Connection closed by server");
+                        return Err(anyhow::anyhow!("Connection closed"));
                     }
                     Some(Err(e)) => {
-                        println!("WebSocket error: {e}");
-                        break;
+                        eprintln!("WebSocket error: {e}");
+                        return Err(e.into());
                     }
                     _ => {}
                 }
             }
             msg = input_rx.recv() => {
                 if let Some(msg) = msg {
-                    write.send(tokio_tungstenite::tungstenite::Message::text(
+                    if write.send(tokio_tungstenite::tungstenite::Message::text(
                         serde_json::to_string(&msg)?
-                    )).await?;
+                    )).await.is_err() {
+                        eprintln!("Failed to send message to server");
+                        return Err(anyhow::anyhow!("Failed to send message"));
+                    }
                 }
             }
         }
     }
-
-    Ok(())
 }
 
 fn main() {
